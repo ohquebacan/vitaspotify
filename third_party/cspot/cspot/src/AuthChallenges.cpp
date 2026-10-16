@@ -32,7 +32,18 @@ std::vector<uint8_t> AuthChallenges::prepareAuthPacket(
     std::vector<uint8_t>& authData, int authType, const std::string& deviceId,
     const std::string& username) {
   // prepare authentication request proto
-  pbPutString(username, authRequest.login_credentials.username);
+  //
+  // The username is left out entirely when there is none, rather than sent
+  // blank: an OAuth access token (AUTHENTICATION_SPOTIFY_TOKEN) identifies the
+  // account by itself, and librespot omits the field on that path. Sending an
+  // empty required string instead is the one difference that is not worth
+  // risking, so authentication.proto makes the field optional and this sets
+  // has_username only when a name was actually supplied -- the stored
+  // credential and user/pass logins always supply one, so they are unchanged.
+  authRequest.login_credentials.has_username = !username.empty();
+  if (!username.empty()) {
+    pbPutString(username, authRequest.login_credentials.username);
+  }
 
   std::copy(authData.begin(), authData.end(),
             authRequest.login_credentials.auth_data.bytes);

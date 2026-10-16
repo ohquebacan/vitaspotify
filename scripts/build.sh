@@ -40,7 +40,7 @@ prefer_python_with_protobuf
 
 git submodule update --init --recursive
 
-"$ROOT/scripts/optimize_icon0.sh"
+"$ROOT/scripts/optimize_sce_sys.sh"
 
 mkdir -p build
 cd build

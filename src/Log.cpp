@@ -1,5 +1,7 @@
 #include "Log.h"
 
+#include <psp2/io/fcntl.h>
+
 #include <BellLogger.h>
 
 #include <cstdarg>
@@ -61,6 +63,13 @@ class VitaFileLogger : public bell::AbstractLogger {
 };
 
 void init_logger() {
+    // Keep the last run's log before truncating this one. After a crash the
+    // console relaunches the app, which is exactly when the log that would
+    // explain it gets overwritten -- so the one that matters is the previous
+    // one, next to the psp2dmp the crash leaves in ux0:data/.
+    sceIoRemove(LOG_PREV_FILE_NAME);
+    sceIoRename(LOG_FILE_NAME, LOG_PREV_FILE_NAME);
+
     logger_fp = fopen(LOG_FILE_NAME, "w");
     if (logger_fp != nullptr) {
         fprintf(logger_fp, "VitaSpotify log started\n");

@@ -58,7 +58,7 @@ message SystemInfo {
 }
 
 message LoginCredentials {
-    required string username = 0xa;
+    optional string username = 0xa;
     required AuthenticationType typ = 0x14; 
     required bytes auth_data = 0x1e;
 }

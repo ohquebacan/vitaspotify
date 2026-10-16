@@ -1,4 +1,9 @@
+#include <psp2/power.h>
+
+#include <Logger.h>
+
 #include "App.h"
+#include "Pairing.h"
 
 #include <psp2/ctrl.h>
 #include <psp2/kernel/processmgr.h>
@@ -12,6 +17,7 @@
 #include <string>
 
 #include <CDNAudioFile.h>
+#include <CSpotContext.h>
 #include <LoginBlob.h>
 #include <SpircHandler.h>
 #include <TrackQueue.h>
@@ -34,6 +40,7 @@ extern std::shared_ptr<cspot::SpircHandler> g_spircHandler;
 extern std::shared_ptr<class VitaPlayer> g_player;
 extern std::atomic<bool> g_playbackPaused;
 extern std::mutex g_cspot_mutex;
+extern std::shared_ptr<cspot::Context> g_ctx;
 
 #ifndef VITA_APP_VERSION
 #define VITA_APP_VERSION "?"
@@ -100,23 +107,29 @@ static int playback_focus_from_ui(int uiId) {
     }
 }
 
-// Login menu (auth.json is the only working sign-in path, so username/password
-// entry was removed). With a saved session: [Log in], [Play offline], [Quit].
-// Without one: [Play offline], [Quit] (drop auth.json in to enable Log in).
+// Login menu. Signing in on the console is always offered, since it needs
+// nothing on the SD card; the saved-session entry appears once there is an
+// auth.json to resume, whether this console wrote it or it was copied in.
+// With a saved session: [Sign in], [Resume], [Play offline], [Quit].
+// Without one: [Sign in], [Play offline], [Quit].
 static int login_item_count(bool has_saved) {
-    return has_saved ? 3 : 2;
+    return has_saved ? 4 : 3;
+}
+
+static int login_pair_item_index(bool /*has_saved*/) {
+    return 0;
 }
 
 static int login_authjson_item_index(bool has_saved) {
-    return has_saved ? 0 : -1;
+    return has_saved ? 1 : -1;
 }
 
 static int login_offline_item_index(bool has_saved) {
-    return has_saved ? 1 : 0;
+    return has_saved ? 2 : 1;
 }
 
 static int login_quit_item_index(bool has_saved) {
-    return has_saved ? 2 : 1;
+    return has_saved ? 3 : 2;
 }
 
 void App::set_status(const std::string &msg) {
@@ -946,14 +959,15 @@ void App::init() {
 
     std::string authData;
     has_saved_session =
-        g_file && g_file->readFile(CREDENTIALS_FILE_NAME, authData) && !authData.empty();
+        g_file && g_file->readFile(CREDENTIALS_FILE_NAME, authData) &&
+        !authData.empty() && pair_credentials_resumable(authData);
 
     if (load_dev_login(username, sizeof(username), password, sizeof(password))) {
         set_status("Dev login loaded from dev_login.txt — Cross on Log in");
     } else if (has_saved_session) {
-        set_status("Resume = saved login. Path: ux0:data/vitaspotify/auth.json");
+        set_status("Resume = the login already saved on this card.");
     } else {
-        set_status("Cross = select. Put auth.json in ux0:data/vitaspotify/");
+        set_status("Cross = select. Sign in needs only this console.");
     }
 }
 
@@ -961,10 +975,11 @@ void App::draw_login() {
     draw_screen_header(this, "VitaSpotify", false);
 
     const int count = login_item_count(has_saved_session);
-    const char *labels[3];
+    const char *labels[4];
     int n = 0;
+    labels[n++] = "Sign in with Spotify";
     if (has_saved_session) {
-        labels[n++] = "Log in (auth.json)";
+        labels[n++] = "Resume saved session";
     }
     labels[n++] = "Play offline (downloads)";
     labels[n++] = "Quit";
@@ -984,10 +999,10 @@ void App::draw_login() {
         Gfx::text(24, y, 0.9f, 0xFF5050E0,
                   auth_failure_msg[0] ? auth_failure_msg : "Login failed.");
         Gfx::text(24, y + 26, 0.8f, Gfx::COLOR_MUTED,
-                  "Put auth.json in ux0:data/vitaspotify/ to log in.");
+                  "Pick Sign in with Spotify to pair this console again.");
     } else if (!has_saved_session) {
         Gfx::text(24, y, 0.85f, Gfx::COLOR_MUTED,
-                  "No auth.json found. Copy it to ux0:data/vitaspotify/ to log in.");
+                  "Not signed in. Sign in with Spotify needs no file on the card.");
     }
     {
         std::lock_guard<std::mutex> lock(ui_mutex);
@@ -1001,19 +1016,70 @@ void App::draw_login() {
 
 void App::refresh_playback_transport_state() {
     if (!cspot_started) {
+        reconnecting = false;
         return;
     }
     std::lock_guard<std::mutex> lock(g_cspot_mutex);
+    reconnecting = g_ctx && g_ctx->session && g_ctx->session->isReconnectingNow();
     if (!g_spircHandler) {
         return;
     }
-    track_position_ms.store(g_spircHandler->getPositionMs());
+    const uint32_t pos = g_spircHandler->getPositionMs();
+    track_position_ms.store(pos);
     shuffle_on.store(g_spircHandler->isShuffleOn());
     repeat_on.store(g_spircHandler->isRepeatOn());
     cspot::TrackInfo info;
     if (g_spircHandler->getTrackQueue()->peekHeadTrackInfo(info) &&
         info.duration > 0) {
         track_duration_ms.store(info.duration);
+    }
+
+    // A track that reaches its end and is not replaced leaves the position
+    // clock free-running: cspot derives it from the wall clock, so it counts
+    // straight past the duration while nothing plays. That is the visible half
+    // of a stall in the track queue -- the player asks for the next track,
+    // gets nothing back, and retries every 100ms without saying so.
+    //
+    // Rather than let the session sit there, the skip is made here once the
+    // clock is past the end. The slack cannot be zero: the app only learns
+    // about the end of a track from this clock, and a normal hand-off takes a
+    // few hundred ms during which the clock is already past the duration. 400
+    // ms of threshold plus 900 ms of dwell is about 1.3s, against the 4s the
+    // first attempt at this took.
+    const uint32_t duration = track_duration_ms.load();
+    if (reconnecting.load() || is_paused.load() || duration == 0 ||
+        pos < duration + 400) {
+        overrun_since_us = 0;
+        return;
+    }
+
+    const uint64_t now = sceKernelGetProcessTimeWide();
+    if (overrun_since_us == 0) {
+        overrun_since_us = now;
+        return;
+    }
+    if (now - overrun_since_us < 900000) {
+        return;
+    }
+    overrun_since_us = 0;
+
+    CSPOT_LOG(info, "track overran its duration (%u > %u ms) -- skipping on",
+              pos, duration);
+    // Already holding g_cspot_mutex, so the queue is poked directly rather
+    // than through the transport helper, which takes the same lock.
+    if (g_spircHandler->nextSong()) {
+        // Mirrors what the Next transport does, so a stall that also left the
+        // player paused does not hand back a silent next track.
+        g_spircHandler->setPause(false);
+        g_playbackPaused = false;
+        pending_play_pause = 0;
+        is_paused = false;
+        track_dirty = true;
+        if (g_player) {
+            g_player->onPlayPause(false);
+        }
+    } else {
+        CSPOT_LOG(info, "nothing left in the queue to skip to");
     }
 }
 
@@ -1137,12 +1203,35 @@ void App::draw_playback() {
         const float dlX = rx + rw - dlBtnW;
         const float dlY = modeY + modeH + 10.0f;
         const bool dlBusy = download_in_progress.load();
-        if (dlBusy || !current_track_downloaded) {
+
+        // Three states, and the saved one stays on screen rather than hiding
+        // the control: a green chip is how you tell at a glance that this
+        // track is already on the card.
+        if (current_track_downloaded && !dlBusy) {
+            Gfx::rect(dlX, dlY, dlBtnW, dlBtnH, Gfx::COLOR_ACCENT);
+            Gfx::text(dlX + 24, dlY + 6, 0.75f, Gfx::COLOR_BG, "Saved");
+        } else {
             Gfx::rect(dlX, dlY, dlBtnW, dlBtnH, Gfx::COLOR_PANEL_HI);
-            Gfx::rectOutline(dlX, dlY, dlBtnW, dlBtnH, 1, Gfx::COLOR_MUTED);
-            Gfx::text(dlX + 10, dlY + 6, 0.75f, Gfx::COLOR_ACCENT,
-                      dlBusy ? "Saving..." : "Download");
-            if (!dlBusy) {
+            if (dlBusy) {
+                // The chip doubles as the progress indicator for this track.
+                const int pct = download_pct.load();
+                if (pct >= 0) {
+                    const float frac = std::min(1.0f, std::max(0.0f, pct / 100.0f));
+                    Gfx::rect(dlX, dlY, dlBtnW * frac, dlBtnH,
+                              Gfx::COLOR_ACCENT_DIM);
+                }
+                char label[24];
+                if (pct >= 0) {
+                    snprintf(label, sizeof(label), "Saving %d%%", pct);
+                } else {
+                    snprintf(label, sizeof(label), "Saving...");
+                }
+                Gfx::rectOutline(dlX, dlY, dlBtnW, dlBtnH, 1, Gfx::COLOR_ACCENT);
+                Gfx::text(dlX + 10, dlY + 6, 0.75f, Gfx::COLOR_TEXT, label);
+            } else {
+                Gfx::rectOutline(dlX, dlY, dlBtnW, dlBtnH, 1, Gfx::COLOR_MUTED);
+                Gfx::text(dlX + 10, dlY + 6, 0.75f, Gfx::COLOR_ACCENT,
+                          "Download");
                 add_ui_hit(dlX, dlY, dlBtnW, dlBtnH,
                            static_cast<int>(PlaybackUi::Download));
             }
@@ -1154,7 +1243,8 @@ void App::draw_playback() {
                          status.c_str(), Gfx::SCREEN_W - 48);
     }
 
-    draw_footer("D-pad = move highlight   Cross = select   Touch = tap");
+    draw_footer("D-pad = highlight   Cross = select   "
+                "Screen off: Up/Right = next, Left/Down = back");
 }
 
 bool App::poll_quit_request() {
@@ -1288,8 +1378,11 @@ void App::poll_events() {
     process_download_commands();
     process_playlist_download();
 
-    // While a download is running it uses curl; don't fire a second concurrent
-    // curl fetch for album art from the main thread.
+    // A download already has a curl transfer in flight; album art is the one
+    // thing here that would open a second one, so it is the only thing that
+    // waits. The rest is local state, and it has to keep running now that
+    // playback does too -- otherwise a track change during a download would
+    // leave the screen showing the previous song.
     const bool dlBusy = download_in_progress.load() || pl_dl_active;
 
     if (local_playback.load()) {
@@ -1298,17 +1391,27 @@ void App::poll_events() {
             update_offline_album_art();
         }
         request_redraw();
-    } else if (cspot_started && !dlBusy) {
+    } else if (cspot_started) {
         refresh_now_playing_metadata();
         refresh_playback_transport_state();
-        update_album_art();
+        if (!dlBusy) {
+            update_album_art();
+        }
+    }
+
+    if (pairing_ready.load() && !cspot_connecting.load()) {
+        finish_pairing();
     }
 
     if (auth_ok.exchange(false)) {
-        screen = Screen::PLAYBACK;
+        // Not Now Playing: right after a login there is no track, so that
+        // screen has nothing to show and its Play button nothing to resume --
+        // it was always one extra hop to get to the library. Land there.
+        screen = Screen::BROWSE;
+        browse_index = 0;
         menu_index = 0;
         playback_focus = FocusPlayPause;
-        set_status("In Spotify: pick PS Vita (VitaSpotify) as device.");
+        set_status("Connected. Pick something here, or choose the Vita in Spotify.");
     }
 
     if (track_dirty.exchange(false)) {
@@ -1355,7 +1458,10 @@ bool App::handle_login_input() {
 
     if ((pressed & SCE_CTRL_CROSS) && !cspot_connecting &&
         !is_pad_confirm_blocked()) {
-        if (menu_index == login_authjson_item_index(has_saved_session)) {
+        if (menu_index == login_pair_item_index(has_saved_session)) {
+            start_pairing();
+            changed = true;
+        } else if (menu_index == login_authjson_item_index(has_saved_session)) {
             login_with_authjson();
             changed = true;
         } else if (menu_index == login_offline_item_index(has_saved_session)) {
@@ -1397,6 +1503,235 @@ void App::login_with_authjson() {
     }
 }
 
+namespace {
+
+// Runs the whole device grant: ask for a code, then poll until the user acts.
+// Every call here blocks, which is why this is a thread and not a step on the
+// main loop -- a 20-second curl timeout on the UI thread would look like a
+// hang, and the poll interval Spotify asks for is several seconds.
+int pairing_thread(SceSize /*args*/, void *argp) {
+    auto *app = *static_cast<App **>(argp);
+
+    PairRequest req;
+    std::string err;
+    if (!pair_begin(req, err)) {
+        {
+            std::lock_guard<std::mutex> lock(app->pairing_mutex);
+            app->pairing_status = "Could not reach Spotify: " + err;
+        }
+        app->pairing_active = false;
+        app->request_redraw();
+        return 0;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(app->pairing_mutex);
+        app->pairing_code = req.user_code;
+        app->pairing_uri = req.verification_uri;
+        app->pairing_status = "Waiting for you to enter the code...";
+    }
+    app->request_redraw();
+
+    int interval_s = req.interval_s;
+    const time_t deadline = time(nullptr) + req.expires_in_s;
+
+    while (!app->pairing_cancel.load() && app->isRunning.load()) {
+        // Sleep in short slices so Circle cancels without waiting out the
+        // whole interval.
+        for (int i = 0; i < interval_s * 4 && !app->pairing_cancel.load(); i++) {
+            sceKernelDelayThread(250 * 1000);
+        }
+        if (app->pairing_cancel.load() || !app->isRunning.load()) {
+            break;
+        }
+        if (time(nullptr) > deadline) {
+            std::lock_guard<std::mutex> lock(app->pairing_mutex);
+            app->pairing_status = "The code expired. Start again.";
+            break;
+        }
+
+        std::string token;
+        const PairStatus st = pair_poll(req, token, err);
+        if (st == PairStatus::Ok) {
+            std::lock_guard<std::mutex> lock(app->pairing_mutex);
+            app->pairing_token = token;
+            app->pairing_status = "Paired. Connecting...";
+            app->pairing_ready = true;
+            break;
+        }
+        if (st == PairStatus::SlowDown) {
+            interval_s += 5;
+            continue;
+        }
+        if (st == PairStatus::Pending) {
+            continue;
+        }
+
+        std::lock_guard<std::mutex> lock(app->pairing_mutex);
+        app->pairing_status = st == PairStatus::Denied
+                                  ? "Sign-in was refused on the other device."
+                              : st == PairStatus::Expired
+                                  ? "The code expired. Start again."
+                                  : "Sign-in failed: " + err;
+        break;
+    }
+
+    app->pairing_active = false;
+    app->request_redraw();
+    return 0;
+}
+
+SceUID pairing_id = -1;
+
+}  // namespace
+
+void App::start_pairing() {
+    if (pairing_active.load()) {
+        screen = Screen::PAIRING;
+        request_redraw();
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(pairing_mutex);
+        pairing_code.clear();
+        pairing_uri.clear();
+        pairing_token.clear();
+        pairing_status = "Asking Spotify for a code...";
+    }
+    pairing_ready = false;
+    pairing_cancel = false;
+    auth_failed = false;
+    auth_failure_msg[0] = '\0';
+
+    pairing_id = sceKernelCreateThread("pairing", (SceKernelThreadEntry)pairing_thread,
+                                       0x10000100, 0x20000, 0, 0, nullptr);
+    if (pairing_id < 0) {
+        std::lock_guard<std::mutex> lock(pairing_mutex);
+        pairing_status = "Could not start the sign-in thread.";
+        screen = Screen::PAIRING;
+        request_redraw();
+        return;
+    }
+
+    pairing_active = true;
+    screen = Screen::PAIRING;
+    App *app_ptr = this;
+    sceKernelStartThread(pairing_id, sizeof(void *), &app_ptr);
+    request_redraw();
+}
+
+void App::cancel_pairing() {
+    pairing_cancel = true;
+    // Not waited on: the thread is in a 250ms sleep slice or a curl call with a
+    // timeout, so it ends on its own, and holding the UI for it would be the
+    // freeze this thread exists to avoid.
+    {
+        std::lock_guard<std::mutex> lock(pairing_mutex);
+        pairing_token.clear();
+    }
+    pairing_ready = false;
+    screen = Screen::LOGIN;
+    request_redraw();
+}
+
+void App::finish_pairing() {
+    std::string token;
+    {
+        std::lock_guard<std::mutex> lock(pairing_mutex);
+        token = pairing_token;
+        pairing_token.clear();
+    }
+    pairing_ready = false;
+    if (token.empty()) {
+        return;
+    }
+
+    // Written to auth.json rather than only held in memory so a connect that
+    // fails here can be retried from the menu. The token is good for one AP
+    // login; the moment that login succeeds, main.cpp overwrites this file
+    // with the reusable credentials, which is what later runs resume from.
+    const std::string json = pair_credentials_json(token);
+    if (!g_file || !g_file->writeFile(CREDENTIALS_FILE_NAME, json)) {
+        std::lock_guard<std::mutex> lock(pairing_mutex);
+        pairing_status = "Could not write ux0:data/vitaspotify/auth.json";
+        request_redraw();
+        return;
+    }
+
+    has_saved_session = true;
+    screen = Screen::LOGIN;
+    menu_index = login_authjson_item_index(true);
+    login_with_authjson();
+}
+
+void App::draw_pairing() {
+    draw_screen_header(this, "Sign in with Spotify", true);
+
+    std::string code, uri, status;
+    {
+        std::lock_guard<std::mutex> lock(pairing_mutex);
+        code = pairing_code;
+        uri = pairing_uri;
+        status = pairing_status;
+    }
+
+    float y = kContentTop;
+    if (code.empty()) {
+        Gfx::text(24, y, 0.95f, Gfx::COLOR_SUBTEXT, status.c_str());
+        draw_footer("Circle = back");
+        return;
+    }
+
+    Gfx::text(24, y, 0.9f, Gfx::COLOR_SUBTEXT, "On your phone or computer, open");
+    y += 34;
+    Gfx::text(24, y, 1.15f, Gfx::COLOR_ACCENT, uri.c_str());
+    y += 52;
+    Gfx::text(24, y, 0.9f, Gfx::COLOR_SUBTEXT, "and enter this code:");
+    y += 40;
+
+    // The code is the one thing the user has to read off the screen from a
+    // distance, so it gets the largest type in the app.
+    const float panelW = 420.0f;
+    const float panelH = 96.0f;
+    Gfx::rect(24, y, panelW, panelH, Gfx::COLOR_PANEL);
+    Gfx::rectOutline(24, y, panelW, panelH, 2, Gfx::COLOR_PANEL_HI);
+    Gfx::text(48, y + 24, 2.2f, Gfx::COLOR_TEXT, code.c_str());
+    y += panelH + 28;
+
+    Gfx::textClipped(24, y, 0.85f, Gfx::COLOR_MUTED, status.c_str(),
+                     Gfx::SCREEN_W - 48);
+    y += 30;
+    Gfx::text(24, y, 0.8f, Gfx::COLOR_MUTED,
+              "No password is typed on the Vita.");
+
+    draw_footer("Circle = cancel   The code is good for a few minutes");
+}
+
+bool App::handle_pairing_input() {
+    SceCtrlData pad;
+    static SceCtrlData old_pad = {};
+    static bool pad_seeded = false;
+
+    if (sceCtrlPeekBufferPositive(0, &pad, 1) < 1) {
+        return false;
+    }
+    if (!pad_seeded) {
+        old_pad = pad;
+        pad_seeded = true;
+        return false;
+    }
+
+    const auto pressed = static_cast<unsigned int>(~old_pad.buttons & pad.buttons);
+    old_pad = pad;
+
+    if (pressed & SCE_CTRL_CIRCLE) {
+        cancel_pairing();
+        return true;
+    }
+    return false;
+}
+
 void App::go_online() {
     request_disconnect = true;
     cspot_started = false;
@@ -1423,7 +1758,9 @@ void App::login_activate_item(int item) {
     if (cspot_connecting) {
         return;
     }
-    if (item == login_authjson_item_index(has_saved_session)) {
+    if (item == login_pair_item_index(has_saved_session)) {
+        start_pairing();
+    } else if (item == login_authjson_item_index(has_saved_session)) {
         login_with_authjson();
     } else if (item == login_offline_item_index(has_saved_session)) {
         enter_offline_library();
@@ -2384,10 +2721,60 @@ void App::render() {
         draw_offline_home();
     } else if (screen == Screen::RESULTS) {
         draw_results();
+    } else if (screen == Screen::PAIRING) {
+        draw_pairing();
     } else {
         draw_playback();
     }
+    draw_download_bar();
     Gfx::endFrame();
+}
+
+void App::draw_download_bar() {
+    if (reconnecting.load()) {
+        constexpr float h = 26.0f;
+        const float y = Gfx::SCREEN_H - h;
+        Gfx::rect(0, y, Gfx::SCREEN_W, h, Gfx::COLOR_PANEL);
+        Gfx::rect(0, y, Gfx::SCREEN_W, 2, 0xFF50C8E0);
+        Gfx::textClipped(12, y + 5, 0.72f, Gfx::COLOR_TEXT,
+                         "Lost the connection to Spotify -- reconnecting. "
+                         "Playback and skipping resume on their own.",
+                         Gfx::SCREEN_W - 24);
+        return;
+    }
+
+    if (!download_in_progress.load()) {
+        return;
+    }
+
+    std::string title;
+    {
+        std::lock_guard<std::mutex> lock(download_done_mutex);
+        title = download_done_title;
+    }
+
+    // A strip along the very bottom: tall enough to read, short enough that it
+    // covers no control on any screen.
+    constexpr float h = 26.0f;
+    const float y = Gfx::SCREEN_H - h;
+    Gfx::rect(0, y, Gfx::SCREEN_W, h, Gfx::COLOR_PANEL);
+
+    const int pct = download_pct.load();
+    if (pct >= 0) {
+        const float frac = std::min(1.0f, std::max(0.0f, pct / 100.0f));
+        Gfx::rect(0, y, Gfx::SCREEN_W * frac, h, Gfx::COLOR_ACCENT_DIM);
+    }
+
+    char label[160];
+    if (pct >= 0) {
+        snprintf(label, sizeof(label), "Saving %d%%  -  %s", pct,
+                 title.empty() ? "track" : title.c_str());
+    } else {
+        snprintf(label, sizeof(label), "Saving  -  %s",
+                 title.empty() ? "track" : title.c_str());
+    }
+    Gfx::textClipped(12, y + 5, 0.72f, Gfx::COLOR_TEXT, label,
+                     Gfx::SCREEN_W - 24);
 }
 
 void App::present_download_overlay(const std::string& label, int pct) {
@@ -2450,6 +2837,8 @@ void App::run() {
         const Screen screen_before_input = screen;
 
         render();
+        // After the swap, so it only moves when a frame really went out.
+        ui_frames.fetch_add(1);
         process_touch();
 
         if (screen == Screen::LOGIN) {
@@ -2464,6 +2853,8 @@ void App::run() {
             handle_offline_home_input();
         } else if (screen == Screen::RESULTS) {
             handle_results_input();
+        } else if (screen == Screen::PAIRING) {
+            handle_pairing_input();
         } else {
             handle_playback_input();
         }

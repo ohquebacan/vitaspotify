@@ -2,9 +2,9 @@ cmake_minimum_required(VERSION 3.10)
 # cspot/bell still declare CMake 2.8; required for CMake 4.x hosts
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
-set(VITA_APP_NAME "VitaSpotify")
+set(VITA_APP_NAME "SpotiBacan")
 set(VITA_TITLEID "VSPOT0001")
-set(VITA_VERSION "01.03")
+set(VITA_VERSION "01.04")
 
 if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     if(DEFINED ENV{VITASDK})
@@ -17,8 +17,12 @@ endif()
 project(vitaspotify C CXX)
 include("${VITASDK}/share/vita.cmake" REQUIRED)
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -std=c++20")
+# -g costs nothing in the VPK -- only loadable sections reach eboot.bin -- and
+# it is what lets arm-vita-eabi-addr2line turn a psp2dmp crash address into a
+# file and line. Without it a dump can only say which rodata label the program
+# jumped into, which is where this build's crashes landed.
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -std=gnu11 -g")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-rtti -std=c++20 -g")
 set(CMAKE_CXX_STANDARD 20)
 
 # Vita-specific queue (mutex/cond) for bell
@@ -32,6 +36,26 @@ file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/HTTPClient.h
      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/bell/main/io/include)
 file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/HTTPClient.cpp
      DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/bell/main/io)
+
+# On-console login: the OAuth access token does not fit cspot's 512-byte
+# auth_data, and it is sent without a username, which the proto declares
+# required. See patch/AuthChallenges.cpp for the second half of that change.
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/authentication.proto
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/protobuf)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/authentication.options
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/protobuf)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/AuthChallenges.cpp
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/src)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/Session.h
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/include)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/Session.cpp
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/src)
+
+# Sends that happen while cspot is reconnecting dereference a null shanConn.
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/MercurySession.cpp
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/src)
+file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/patch/MercurySession.h
+     DESTINATION ${CMAKE_CURRENT_SOURCE_DIR}/third_party/cspot/cspot/include)
 
 set(BELL_DISABLE_WEBSERVER ON CACHE BOOL "" FORCE)
 set(BELL_DISABLE_MQTT ON CACHE BOOL "" FORCE)
@@ -70,6 +94,7 @@ add_executable(${PROJECT_NAME}
     src/main.cpp
     src/App.cpp
     src/API.cpp
+    src/Pairing.cpp
     src/Gfx.cpp
     src/Touch.cpp
     src/Utils.cpp
@@ -128,6 +153,9 @@ vita_create_vpk(${PROJECT_NAME}.vpk ${VITA_TITLEID} eboot.bin
     VERSION ${VITA_VERSION}
     NAME ${VITA_APP_NAME}
     FILE assets/sce_sys/icon0.png sce_sys/icon0.png
+    FILE assets/sce_sys/livearea/contents/bg.png sce_sys/livearea/contents/bg.png
+    FILE assets/sce_sys/livearea/contents/startup.png sce_sys/livearea/contents/startup.png
+    FILE assets/sce_sys/livearea/contents/template.xml sce_sys/livearea/contents/template.xml
     FILE assets/ui/back.png assets/ui/back.png
     FILE assets/ui/forwards.png assets/ui/forwards.png
     FILE assets/ui/pauseplay.png assets/ui/pauseplay.png

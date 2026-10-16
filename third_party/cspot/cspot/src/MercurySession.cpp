@@ -305,8 +305,21 @@ uint64_t MercurySession::executeSubscription(RequestType method,
   // Bump sequence id
   this->sequenceId += 1;
 
+  // reconnect() sets shanConn to nullptr while it dials a new access point,
+  // and these sends run from whatever thread asked for them -- the UI thread
+  // asking to skip a track, for one. `shanConn->sendPacket` on a null
+  // shared_ptr is a hardware fault, not an exception, so the catch below never
+  // sees it: the process just dies. Taking a copy both null-checks it and
+  // keeps the object alive for the length of the call if reconnect() replaces
+  // the member underneath us.
+  auto conn = this->shanConn;
+  if (!conn) {
+    CSPOT_LOG(error, "Dropping a request: not connected");
+    return this->sequenceId - 1;
+  }
+
   try {
-    this->shanConn->sendPacket(
+    conn->sendPacket(
         static_cast<std::underlying_type<RequestType>::type>(method),
         sequenceIdBytes);
   } catch (...) {
@@ -337,8 +350,21 @@ uint32_t MercurySession::requestAudioKey(const std::vector<uint8_t>& trackId,
 
   // Used for broken connection detection
   // this->lastRequestTimestamp = timeProvider->getSyncedTimestamp();
+  // reconnect() sets shanConn to nullptr while it dials a new access point,
+  // and these sends run from whatever thread asked for them -- the UI thread
+  // asking to skip a track, for one. `shanConn->sendPacket` on a null
+  // shared_ptr is a hardware fault, not an exception, so the catch below never
+  // sees it: the process just dies. Taking a copy both null-checks it and
+  // keeps the object alive for the length of the call if reconnect() replaces
+  // the member underneath us.
+  auto conn = this->shanConn;
+  if (!conn) {
+    CSPOT_LOG(error, "Dropping an audio key request: not connected");
+    return audioKeySequence - 1;
+  }
+
   try {
-    this->shanConn->sendPacket(
+    conn->sendPacket(
         static_cast<uint8_t>(RequestType::AUDIO_KEY_REQUEST_COMMAND), buffer);
   } catch (...) {
     // @TODO: Handle disconnect

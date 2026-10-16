@@ -40,6 +40,8 @@
 #include <AccessKeyFetcher.h>
 #include <ApResolve.h>
 
+#include <psp2/power.h>
+#include <curl/curl.h>
 #include "cJSON.h"
 
 std::shared_ptr<CliFile> g_file;
@@ -51,6 +53,10 @@ std::shared_ptr<VitaPlayer> g_player;
 std::atomic<bool> g_playbackPaused{true};
 
 static int watch_id = -1;
+static int remote_id = -1;
+
+// Defined below, next to its other caller.
+void apply_online_transport(App *app, TransportCmd cmd);
 static int quit_listener_id = -1;
 static int cspot_id = -1;
 std::mutex g_cspot_mutex;
@@ -181,8 +187,189 @@ SceVoid watch_dog(SceSize /*args*/, void *argp) {
         const bool onlinePlaying = app->cspot_started && !g_playbackPaused.load();
         const bool offlinePlaying = app->local_playback.load();
         if (onlinePlaying || offlinePlaying) {
+            // Keeps the system from suspending outright. It deliberately does
+            // not keep the panel awake: the screen turning itself off while
+            // the music carries on is the behaviour this app wants.
             sceKernelPowerTick(SCE_KERNEL_POWER_TICK_DISABLE_AUTO_SUSPEND);
         }
+    }
+}
+
+// Reads the pad on its own thread so track control works when the main loop
+// cannot help: with the panel off the render loop can be parked in the buffer
+// swap, and anything queued for it would sit unhandled.
+//
+// The volume buttons are the gesture that works with the screen off, held for
+// two seconds so a real volume change is never mistaken for a skip. Nothing in
+// the app binds them otherwise, so this needs no screen-state detection at all
+// -- which is the point, since the notification that was supposed to report
+// the panel going off never arrives for a non-system app.
+//
+// It also logs what the pad actually reports, because what a Vita hands a
+// normal app once the screen is off is not something the SDK documents.
+SceVoid remote_control(SceSize /*args*/, void *argp) {
+    auto *app = *static_cast<App **>(argp);
+
+    constexpr unsigned kPollUs = 100000;
+
+    // The volume and power bits only come back from the Ext read, and that
+    // read wants its own sampling mode set. If it is refused, the log below
+    // shows ext=0x00000000, which is itself the answer.
+    const int extMode = sceCtrlSetSamplingModeExt(SCE_CTRL_MODE_ANALOG_WIDE);
+    CSPOT_LOG(info, "remote: sceCtrlSetSamplingModeExt = 0x%08X", extMode);
+
+    // With the panel off the system takes the pad: the only thing that comes
+    // back is SCE_CTRL_INTERCEPTED and no buttons at all. sceCtrlSetButtonIntercept
+    // is the one documented way to ask for it back ("allows the current thread
+    // to intercept controls"), and it is written for plugins, so a plain app
+    // may well be refused -- the return code is logged either way.
+    //
+    // It is only asked for while something is playing, and it is given back
+    // after kIntercept at the latest, because while it is held the PS button
+    // and the quick menu belong to this app instead of the shell.
+    bool intercepting = false;
+    uint64_t intercept_since = 0;
+    uint64_t taken_since = 0;
+    constexpr uint64_t kIntercept = 5000000;    // then let go and look
+
+    bool warned_idle = false;
+    unsigned last_logged = 0xFFFFFFFFu;
+    uint64_t last_frames = 0;
+    uint64_t frames_moved_at = sceKernelGetProcessTimeWide();
+
+    while (app->isRunning) {
+        sceKernelDelayThread(kPollUs);
+
+        const uint64_t now = sceKernelGetProcessTimeWide();
+
+        SceCtrlData pad;
+        SceCtrlData padExt;
+        const int got = sceCtrlPeekBufferPositive(0, &pad, 1);
+        const int gotExt = sceCtrlPeekBufferPositiveExt(0, &padExt, 1);
+        const unsigned plain = got >= 1 ? pad.buttons : 0u;
+        const unsigned ext = gotExt >= 1 ? padExt.buttons : 0u;
+        const unsigned buttons = plain | ext;
+
+        // Is the main loop still presenting frames?
+        const uint64_t frames = app->ui_frames.load();
+        if (frames != last_frames) {
+            last_frames = frames;
+            frames_moved_at = now;
+        }
+        const bool ui_stalled = now - frames_moved_at > 1500000;
+        const bool playing =
+            (app->cspot_started && !g_playbackPaused.load()) ||
+            app->local_playback.load();
+        app->screen_off = ui_stalled && playing;
+
+        // SCE_CTRL_INTERCEPTED on the ordinary read means the system has the
+        // pad, which in practice is the panel being off -- the frame counter
+        // keeps moving in that state, so a stalled render loop turned out not
+        // to be the signal it looked like it would be.
+        //
+        // While the grab is held the ordinary read keeps reporting
+        // INTERCEPTED whoever is holding it, so it cannot say when the screen
+        // comes back. Hence the probe: let go for a moment every few seconds
+        // and look. If the system no longer has it, the screen is on and the
+        // pad belongs to the UI again.
+        if (!intercepting) {
+            const bool taken = (plain & SCE_CTRL_INTERCEPTED) != 0;
+            if (taken) {
+                if (taken_since == 0) {
+                    taken_since = now;
+                }
+            } else {
+                taken_since = 0;
+            }
+            if (taken_since != 0 && !playing) {
+                // Worth seeing in the log: the pad is gone and the grab is not
+                // even attempted, which from outside looks the same as the
+                // grab being refused.
+                if (!warned_idle) {
+                    warned_idle = true;
+                    CSPOT_LOG(info, "remote: screen off but nothing playing -- "
+                                    "not taking the pad");
+                }
+            } else if (taken_since == 0) {
+                warned_idle = false;
+            }
+            if (playing && taken_since != 0 && now - taken_since > 400000) {
+                const int r = sceCtrlSetButtonIntercept(1);
+                if (r >= 0) {
+                    intercepting = true;
+                    intercept_since = now;
+                    app->screen_off = true;
+                    CSPOT_LOG(info, "remote: screen off, pad taken -- "
+                                    "Up/Right = next, Left/Down = back");
+                } else {
+                    CSPOT_LOG(error,
+                              "remote: sceCtrlSetButtonIntercept(1) = 0x%08X",
+                              r);
+                    taken_since = 0;
+                }
+            }
+        } else if (!playing || now - intercept_since > kIntercept) {
+            sceCtrlSetButtonIntercept(0);
+            intercepting = false;
+            app->screen_off = false;
+            // Nothing is re-grabbed on the next pass: taken_since starts from
+            // zero, so the ordinary read has to show the system holding the
+            // pad for a full second again. With the screen back on it never
+            // will, and the probe quietly stops repeating.
+            taken_since = 0;
+        }
+
+        if (buttons != last_logged) {
+            last_logged = buttons;
+            CSPOT_LOG(info,
+                      "remote: pad=0x%08X ext=0x%08X frames=%llu stalled=%d "
+                      "grabbed=%d",
+                      plain, ext, (unsigned long long)frames,
+                      ui_stalled ? 1 : 0, intercepting ? 1 : 0);
+        }
+
+        // No volume gesture here on purpose: SCE_CTRL_VOLUP and VOLDOWN never
+        // reach this app. Two runs of pad logging show them absent from both
+        // the ordinary and the Ext read, screen on or off, grab held or not --
+        // the system consumes them before anything else gets a look. The
+        // d-pad below is the one that does arrive.
+        TransportCmd cmd = TransportCmd::None;
+
+        // With the screen off the d-pad is free -- no list is being navigated
+        // -- so a tap is enough, no hold needed. The buttons only come back on
+        // the Ext read while the grab is held; the ordinary one stays stuck on
+        // INTERCEPTED.
+        if (cmd == TransportCmd::None && intercepting) {
+            static unsigned prev_dpad = 0;
+            const unsigned dpad =
+                buttons & (SCE_CTRL_UP | SCE_CTRL_DOWN | SCE_CTRL_LEFT |
+                           SCE_CTRL_RIGHT);
+            const unsigned pressed = ~prev_dpad & dpad;
+            prev_dpad = dpad;
+            if (pressed & (SCE_CTRL_UP | SCE_CTRL_RIGHT)) {
+                cmd = TransportCmd::Next;
+            } else if (pressed & (SCE_CTRL_DOWN | SCE_CTRL_LEFT)) {
+                cmd = TransportCmd::Prev;
+            }
+        }
+
+        if (cmd == TransportCmd::None || !playing) {
+            continue;
+        }
+
+        CSPOT_LOG(info, "remote: %s",
+                  cmd == TransportCmd::Next ? "next track" : "previous track");
+
+        // Queued, not applied here. The direct call this used to make was
+        // justified by the main loop being parked in the buffer swap with the
+        // screen off -- the frame counter in the logs shows it is not, it
+        // keeps running. So this goes through the one path the buttons use,
+        // and cspot keeps being driven from a single thread.
+        app->pending_transport = static_cast<int>(cmd);
+    }
+
+    if (intercepting) {
+        sceCtrlSetButtonIntercept(0);
     }
 }
 
@@ -325,6 +512,60 @@ void vitaspotify_stop_network_thread() {
     stop_cspot_thread();
 }
 
+// The online half of the transport switch. Called only from the main loop,
+// under g_cspot_mutex.
+void apply_online_transport(App *app, TransportCmd cmd) {
+    {
+        std::lock_guard<std::mutex> lock(g_cspot_mutex);
+        if (g_spircHandler) {
+            switch (cmd) {
+                case TransportCmd::TogglePlay:
+                    g_spircHandler->setPause(!g_playbackPaused.load());
+                    break;
+                case TransportCmd::Next:
+                    if (g_spircHandler->nextSong()) {
+                        g_spircHandler->setPause(false);
+                        g_playbackPaused = false;
+                        app->pending_play_pause = 0;
+                        app->is_paused = false;
+                        app->track_dirty = true;
+                        if (g_player) {
+                            g_player->onPlayPause(false);
+                        }
+                    }
+                    break;
+                case TransportCmd::Prev:
+                    if (g_spircHandler->previousSong()) {
+                        g_spircHandler->setPause(false);
+                        g_playbackPaused = false;
+                        app->pending_play_pause = 0;
+                        app->is_paused = false;
+                        app->track_dirty = true;
+                        if (g_player) {
+                            g_player->onPlayPause(false);
+                        }
+                    } else {
+                        g_spircHandler->getTrackPlayer()->seekMs(0);
+                        g_spircHandler->setPause(false);
+                    }
+                    break;
+                case TransportCmd::ToggleShuffle:
+                    g_spircHandler->toggleShuffle();
+                    app->shuffle_on = g_spircHandler->isShuffleOn();
+                    app->track_dirty = true;
+                    break;
+                case TransportCmd::ToggleRepeat:
+                    g_spircHandler->toggleRepeat();
+                    app->repeat_on = g_spircHandler->isRepeatOn();
+                    app->track_dirty = true;
+                    break;
+                default:
+                    break;
+            }
+        }
+    }
+}
+
 void App::process_playback_commands() {
     if (player_create_pending.exchange(false)) {
         std::lock_guard<std::mutex> lock(g_cspot_mutex);
@@ -393,9 +634,23 @@ void App::process_playback_commands() {
         }
     }
 
-    const int transport = pending_transport.exchange(
-        static_cast<int>(TransportCmd::None));
+    // Skips are spaced out, not dropped: each one tears the player down and
+    // starts a fresh CDN fetch, and presses that land in the middle of that
+    // are what the crash reports have in common. A command that arrives too
+    // soon stays in the pending slot and runs on a later pass, so holding
+    // Next still walks the queue -- just not faster than cspot can follow.
+    //
+    // This is damage control, not a fix: the corruption itself comes from
+    // cspot being driven from the main loop while its own task threads work
+    // on the same queue, and that needs sorting out inside third_party.
+    const uint64_t transport_now = sceKernelGetProcessTimeWide();
+    const bool transport_ready = transport_now - last_transport_us > 500000;
+    const int transport = transport_ready
+                              ? pending_transport.exchange(
+                                    static_cast<int>(TransportCmd::None))
+                              : static_cast<int>(TransportCmd::None);
     if (transport != static_cast<int>(TransportCmd::None)) {
+        last_transport_us = transport_now;
         if (local_playback.load()) {
             switch (static_cast<TransportCmd>(transport)) {
                 case TransportCmd::TogglePlay:
@@ -418,53 +673,7 @@ void App::process_playback_commands() {
             }
             return;
         }
-        std::lock_guard<std::mutex> lock(g_cspot_mutex);
-        if (g_spircHandler) {
-            switch (static_cast<TransportCmd>(transport)) {
-                case TransportCmd::TogglePlay:
-                    g_spircHandler->setPause(!g_playbackPaused.load());
-                    break;
-                case TransportCmd::Next:
-                    if (g_spircHandler->nextSong()) {
-                        g_spircHandler->setPause(false);
-                        g_playbackPaused = false;
-                        pending_play_pause = 0;
-                        is_paused = false;
-                        track_dirty = true;
-                        if (g_player) {
-                            g_player->onPlayPause(false);
-                        }
-                    }
-                    break;
-                case TransportCmd::Prev:
-                    if (g_spircHandler->previousSong()) {
-                        g_spircHandler->setPause(false);
-                        g_playbackPaused = false;
-                        pending_play_pause = 0;
-                        is_paused = false;
-                        track_dirty = true;
-                        if (g_player) {
-                            g_player->onPlayPause(false);
-                        }
-                    } else {
-                        g_spircHandler->getTrackPlayer()->seekMs(0);
-                        g_spircHandler->setPause(false);
-                    }
-                    break;
-                case TransportCmd::ToggleShuffle:
-                    g_spircHandler->toggleShuffle();
-                    shuffle_on = g_spircHandler->isShuffleOn();
-                    track_dirty = true;
-                    break;
-                case TransportCmd::ToggleRepeat:
-                    g_spircHandler->toggleRepeat();
-                    repeat_on = g_spircHandler->isRepeatOn();
-                    track_dirty = true;
-                    break;
-                default:
-                    break;
-            }
-        }
+        apply_online_transport(this, static_cast<TransportCmd>(transport));
     }
 
     if (pending_seek.exchange(false)) {
@@ -509,40 +718,73 @@ PendingDownload g_pendingDl;
 
 }  // namespace
 
+namespace {
+
+SceUID download_id = -1;
+
+// Phase 2, on its own thread. Everything it needs was copied into g_pendingDl
+// by the main loop, so it touches no cspot state and holds no lock; it reports
+// progress through an atomic and the result through download_done_*, which the
+// main loop picks up. Nothing here draws: the bar is rendered by the UI thread
+// like any other widget.
+int download_thread(SceSize /*args*/, void *argp) {
+    auto *app = *static_cast<App **>(argp);
+
+    CSPOT_LOG(info, "download_thread: begin save \"%s\"",
+              g_pendingDl.title.c_str());
+
+    std::string path;
+    std::string err;
+    auto progress = [app](size_t dlnow, size_t dltotal) {
+        app->download_pct =
+            dltotal > 0 ? static_cast<int>((dlnow * 100) / dltotal) : -1;
+    };
+    const bool ok = OfflineStore::saveCdnTrack(
+        g_pendingDl.cdnUrl, g_pendingDl.audioKey, g_pendingDl.title,
+        g_pendingDl.artist, /*playlist=*/"", g_pendingDl.uri, path, err,
+        progress);
+    if (ok && !g_pendingDl.imageUrl.empty()) {
+        OfflineStore::saveCoverFromUrl(g_pendingDl.title, g_pendingDl.imageUrl,
+                                       /*playlist=*/"");
+    }
+
+    std::string msg;
+    if (ok) {
+        msg = "Downloaded: " + g_pendingDl.title;
+    } else {
+        msg = "Download failed";
+        if (!err.empty()) {
+            msg += " (" + err + ")";
+        }
+    }
+    CSPOT_LOG(info, "download_thread: done ok=%d", ok ? 1 : 0);
+
+    {
+        std::lock_guard<std::mutex> lock(app->download_done_mutex);
+        app->download_done_ok = ok;
+        app->download_done_msg = msg;
+        app->download_done_title = g_pendingDl.title;
+    }
+    g_pendingDl = PendingDownload{};
+    app->download_pct = -1;
+    // Last, so the main loop only reads the fields above once they are all set.
+    app->download_done_pending = true;
+    return 0;
+}
+
+}  // namespace
+
 void App::process_download_commands() {
-    // Phase 2: actually perform the (blocking) download on the main thread.
-    if (g_pendingDl.armed) {
-        g_pendingDl.armed = false;
-        std::string path;
-        std::string err;
-        CSPOT_LOG(info, "process_download_commands: begin save \"%s\"",
-                  g_pendingDl.title.c_str());
-        const std::string overlayLabel = g_pendingDl.title;
-        auto progress = [this, overlayLabel](size_t dlnow, size_t dltotal) {
-            const int pct =
-                dltotal > 0 ? static_cast<int>((dlnow * 100) / dltotal) : -1;
-            present_download_overlay(overlayLabel, pct);
-        };
-        const bool ok = OfflineStore::saveCdnTrack(
-            g_pendingDl.cdnUrl, g_pendingDl.audioKey, g_pendingDl.title,
-            g_pendingDl.artist, /*playlist=*/"", g_pendingDl.uri, path, err,
-            progress);
-        if (ok && !g_pendingDl.imageUrl.empty()) {
-            OfflineStore::saveCoverFromUrl(g_pendingDl.title,
-                                           g_pendingDl.imageUrl, /*playlist=*/"");
-        }
-        download_in_progress = false;
+    // The thread has finished: react on the main loop, where touching `screen`
+    // and the downloads list is safe.
+    if (download_done_pending.exchange(false)) {
+        bool ok;
         std::string msg;
-        if (ok) {
-            msg = "Downloaded: " + g_pendingDl.title;
-        } else {
-            msg = "Download failed";
-            if (!err.empty()) {
-                msg += " (" + err + ")";
-            }
+        {
+            std::lock_guard<std::mutex> lock(download_done_mutex);
+            ok = download_done_ok;
+            msg = download_done_msg;
         }
-        CSPOT_LOG(info, "process_download_commands: done ok=%d", ok ? 1 : 0);
-        g_pendingDl = PendingDownload{};
         on_download_finished(ok, msg);
         return;
     }
@@ -594,19 +836,11 @@ void App::process_download_commands() {
         return;
     }
 
-    // Pause audio output while saving (purely local; cspot keeps its stream).
-    {
-        std::lock_guard<std::mutex> lock(g_cspot_mutex);
-        if (g_spircHandler) {
-            g_spircHandler->setPause(true);
-        }
-        if (g_player) {
-            g_player->onPlayPause(true);
-        }
-        g_playbackPaused = true;
-        is_paused = true;
-    }
-
+    // Playback is deliberately left running. The CDN fetch is plain curl on
+    // its own thread, which is the same thing album art already does alongside
+    // the live session; what used to make this look like it needed a pause was
+    // the blocking call sitting on the main loop, freezing the UI and the
+    // track-advance handling with it.
     g_pendingDl.armed = true;
     g_pendingDl.cdnUrl = cdnUrl;
     g_pendingDl.audioKey = audioKey;
@@ -614,8 +848,36 @@ void App::process_download_commands() {
     g_pendingDl.artist = artist;
     g_pendingDl.imageUrl = imageUrl;
     g_pendingDl.uri = uri;
+
+    // Reap the previous one first: a download per song over a long session
+    // would otherwise pile up thread handles until creation starts failing.
+    // It has certainly ended -- download_in_progress gated this path -- so the
+    // wait returns at once.
+    if (download_id >= 0) {
+        sceKernelWaitThreadEnd(download_id, nullptr, nullptr);
+        sceKernelDeleteThread(download_id);
+        download_id = -1;
+    }
+
+    download_id = sceKernelCreateThread("download",
+                                        (SceKernelThreadEntry)download_thread,
+                                        0x10000100, 0x20000, 0, 0, nullptr);
+    if (download_id < 0) {
+        g_pendingDl = PendingDownload{};
+        set_status("Could not start the download thread.");
+        request_redraw();
+        return;
+    }
+
+    download_pct = -1;
     download_in_progress = true;
-    set_status("Saving \"" + title + "\"...");
+    {
+        std::lock_guard<std::mutex> lock(download_done_mutex);
+        download_done_title = title;
+    }
+    set_status("Saving \"" + title + "\" in the background...");
+    App *app_ptr = this;
+    sceKernelStartThread(download_id, sizeof(void *), &app_ptr);
     request_redraw();
 }
 
@@ -794,10 +1056,20 @@ int start_cspot(SceSize /*args*/, void *argp) {
         g_ctx->session->connectWithRandomAp();
         g_ctx->config.authData = g_ctx->session->authenticate(g_loginBlob);
 
+        // A token login carries no username, so the one in the blob is empty
+        // and the access point is the only source for it. Without this the
+        // saved credentials go to auth.json with an empty name, which the next
+        // run cannot log in with -- and the Web API calls that key off the user
+        // id have nothing to work with either.
+        if (g_ctx->config.username.empty() &&
+            !g_ctx->session->canonicalUsername.empty()) {
+            g_ctx->config.username = g_ctx->session->canonicalUsername;
+        }
+
         if (g_ctx->config.authData.empty()) {
             CSPOT_LOG(error, "Authentication failed");
             snprintf(app->auth_failure_msg, sizeof(app->auth_failure_msg),
-                     "Session rejected. Re-copy auth.json from Mac.");
+                     "Session rejected. Sign in with Spotify again.");
             app->cspot_connecting = false;
             app->auth_failed = true;
             g_ctx.reset();
@@ -987,6 +1259,12 @@ int main(void) {
     init_platform();
     init_network();
 
+    // curl initialises itself on the first curl_easy_init(), and that implicit
+    // path is not thread-safe. Several threads now make requests -- the UI
+    // thread for album art, the pairing thread, the download thread -- so the
+    // one-time setup happens here, before any of them exist.
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+
     App *app_p = &app;
 
     quit_listener_id =
@@ -994,6 +1272,13 @@ int main(void) {
                               0x10000100, 0x4000, 0, 0, nullptr);
     if (quit_listener_id >= 0) {
         sceKernelStartThread(quit_listener_id, sizeof(void *), &app_p);
+    }
+
+    remote_id = sceKernelCreateThread("remote",
+                                      (SceKernelThreadEntry)remote_control,
+                                      0x10000100, 0x4000, 0, 0, nullptr);
+    if (remote_id >= 0) {
+        sceKernelStartThread(remote_id, sizeof(void *), &app_p);
     }
 
     watch_id = sceKernelCreateThread("watchdog", (SceKernelThreadEntry)watch_dog,
@@ -1016,6 +1301,12 @@ int main(void) {
         sceKernelWaitThreadEnd(quit_listener_id, nullptr, nullptr);
         sceKernelDeleteThread(quit_listener_id);
         quit_listener_id = -1;
+    }
+
+    if (remote_id >= 0) {
+        sceKernelWaitThreadEnd(remote_id, nullptr, nullptr);
+        sceKernelDeleteThread(remote_id);
+        remote_id = -1;
     }
 
     if (watch_id >= 0) {

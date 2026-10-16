@@ -9,7 +9,7 @@ This is unofficial homebrew and requires Spotify Premium. It is built on
 
 ## What Works
 
-- Login with an `auth.json` file generated on your computer
+- Sign in on the Vita itself: it shows a code, you enter it at spotify.com/pair
 - Now Playing controls
 - Liked Songs, playlists, search, and direct Spotify links
 - Track and playlist downloads for offline playback
@@ -20,25 +20,21 @@ This is unofficial homebrew and requires Spotify Premium. It is built on
 1. Install a current TLS setup on the Vita, such as
    [iTLS-Enso](https://github.com/CelesteBlue-dev/ITLS-Enso).
 2. Install `vitaspotify.vpk` with VitaShell.
-3. On your computer, unzip `VitaSpotify-auth-helper.zip`.
-4. Run the helper for your OS:
-   - macOS: `mac/Get VitaSpotify Login.command`
-   - Windows: `windows/Get VitaSpotify Login.bat`
-   - Linux: `linux/get-vitaspotify-login.sh`
-5. In the Spotify app, play anything, open Connect to a device, and choose
-   `CSpot player`.
-6. Copy the generated login file to the Vita as:
+3. Launch VitaSpotify and choose `Sign in with Spotify`. It shows a short code.
+4. On a phone or a computer, open <https://spotify.com/pair> and enter the code.
 
-```text
-ux0:data/vitaspotify/auth.json
-```
+That is the whole sign-in. No helper to run on a computer, no file to copy, and
+no password typed on the Vita: this is Spotify's device authorization grant, the
+same thing a TV app uses.
 
-Launch VitaSpotify and choose `Log in (auth.json)`.
+The app saves the resulting session to `ux0:data/vitaspotify/auth.json` and
+resumes from it on later runs, so the code is needed once. Keep that file
+private -- it is a saved Spotify login, not a config file to share in issues,
+screenshots, or chat logs. Delete it to sign out.
 
-Keep `auth.json` private. It is a saved Spotify login file, not a config file to
-share in issues, screenshots, or chat logs.
-
-The longer auth guide is in [docs/AUTH.md](docs/AUTH.md).
+An `auth.json` generated the old way, with the helper on a computer, still
+works: drop it in and pick `Resume saved session`. See
+[docs/AUTH.md](docs/AUTH.md).
 
 ## Controls
 

@@ -99,6 +99,13 @@ class MercurySession : public bell::Task, public cspot::Session {
 
   bool triggerTimeout() override;
 
+  // True from the moment the access point connection is dropped until a new
+  // one is authenticated. Exposed so the app can say "Reconnecting" instead of
+  // just going quiet: from the outside a dropped session looks exactly like a
+  // hang -- nothing plays, skipping does nothing -- which is what it got
+  // mistaken for.
+  bool isReconnectingNow() const { return isReconnecting.load(); }
+
  private:
   const int PING_TIMEOUT_MS = 2 * 60 * 1000 + 5000;
 

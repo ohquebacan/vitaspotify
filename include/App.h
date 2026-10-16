@@ -67,10 +67,37 @@ class App {
     std::atomic<bool> auth_failed{false};
     std::atomic<bool> auth_ok{false};
     std::atomic<bool> web_api_ready{false};
+    // cspot has lost the access point and is dialling a new one. Nothing will
+    // play and skipping will do nothing until it comes back, so it is said out
+    // loud rather than left looking like a hang.
+    std::atomic<bool> reconnecting{false};
+
+    // Set when the render loop has stopped producing frames while playback
+    // continues, which is what the panel going off looks like from in here.
+    // The power callback that was supposed to report this never fires for a
+    // non-system app -- registration succeeds and no notification arrives --
+    // so this is inferred from ui_frames instead of asked for.
+    std::atomic<bool> screen_off{false};
+    // Bumped once per presented frame. The remote thread watches it: if it
+    // stops moving, the main loop is blocked in the buffer swap, and anything
+    // queued for the main loop would sit there unhandled.
+    std::atomic<uint64_t> ui_frames{0};
 
     char username[256] = "";
     char password[256] = "";
     char auth_failure_msg[192] = "";
+
+    // On-console login (OAuth device grant, see Pairing.h). The pairing thread
+    // owns every network call and only publishes through these; the UI thread
+    // reads them and never blocks on the network.
+    std::atomic<bool> pairing_active{false};
+    std::atomic<bool> pairing_ready{false};   // a token is waiting to be used
+    std::atomic<bool> pairing_cancel{false};
+    std::mutex pairing_mutex;
+    std::string pairing_code;    // the short code shown on screen
+    std::string pairing_uri;     // where the user types it in
+    std::string pairing_status;  // what the thread is doing, or why it stopped
+    std::string pairing_token;   // an access token: never drawn or logged
 
     std::mutex ui_mutex;
     std::string track_name = "No track";
@@ -106,6 +133,10 @@ class App {
     // Renders a single progress frame; called from the curl transfer callback
     // so the screen animates instead of freezing during a blocking download.
     void present_download_overlay(const std::string& label, int pct);
+    // The slim strip along the bottom of whatever screen is up: a reconnect in
+    // progress, else a background download. One line, never both -- losing the
+    // session is the thing worth the space.
+    void draw_download_bar();
     void play_offline_file(const std::string& oggPath);
     void stop_offline_playback();
     void enter_offline_library();
@@ -129,6 +160,9 @@ class App {
 
     std::atomic<bool> pending_download{false};
     std::atomic<bool> download_in_progress{false};
+    // Percent complete, or -1 when the CDN did not say how big the file is.
+    // Written by the download thread, read by the renderer.
+    std::atomic<int> download_pct{-1};
     std::atomic<bool> local_playback{false};
     bool offline_library_mode = false;
     bool local_shuffle_on = false;
@@ -164,7 +198,8 @@ class App {
         DOWNLOADS,
         PLAYLISTS,
         RESULTS,
-        OFFLINE_HOME
+        OFFLINE_HOME,
+        PAIRING
     };
 
     Screen screen = Screen::LOGIN;
@@ -222,6 +257,12 @@ class App {
     void update_offline_album_art();
     std::string loaded_art_url;  // render-thread only
 
+    // When the position clock first went past the track duration, or 0 when
+    // it has not. Main loop only.
+    uint64_t overrun_since_us = 0;
+    // When the last skip was handed to cspot. Main loop only.
+    uint64_t last_transport_us = 0;
+
     std::vector<UiHit> ui_hits;
     float seek_bar_x = 0, seek_bar_y = 0, seek_bar_w = 0, seek_bar_h = 0;
 
@@ -270,6 +311,13 @@ class App {
 
     void login_activate_item(int item);
     void login_with_authjson();
+    void start_pairing();
+    void cancel_pairing();
+    // Hands the paired token to cspot. On the main loop, so the login it
+    // starts goes through exactly the same path as a saved session.
+    void finish_pairing();
+    void draw_pairing();
+    bool handle_pairing_input();
     void go_online();
     void browse_activate_item(int item);
     void results_activate_row(int local_row);

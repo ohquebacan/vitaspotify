@@ -31,6 +31,12 @@ class Session {
 
   std::shared_ptr<cspot::ShannonConnection> shanConn;
 
+  // The name the access point says this account really has, from APWelcome.
+  // It is the only place a token login can learn it: the login itself carried
+  // no username, and the saved credentials are useless without one, since a
+  // stored-credential login sends the name alongside them.
+  std::string canonicalUsername;
+
   void connect(std::unique_ptr<cspot::PlainConnection> connection);
   void connectWithRandomAp();
   void close();

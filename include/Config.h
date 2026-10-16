@@ -12,6 +12,9 @@ class App;
 #define DEV_LOGIN_FILE_NAME   "ux0:data/vitaspotify/dev_login.txt"
 #define CONFIG_FILE_NAME      "ux0:data/vitaspotify/config.json"
 #define LOG_FILE_NAME         "ux0:data/vitaspotify/log.txt"
+// The log is truncated on every launch, so a crash leaves nothing behind: the
+// restart that follows wipes the evidence. The previous run is kept here.
+#define LOG_PREV_FILE_NAME    "ux0:data/vitaspotify/log.prev.txt"
 #define OFFLINE_DL_DIR        "ux0:data/vitaspotify/dl/"
 
 #define CLIENT_ID_ANDROID     "65b708073fc0480ea92a077233ca87bd"
