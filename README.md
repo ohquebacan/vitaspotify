@@ -1,6 +1,8 @@
-# VitaSpotify
+# SpotiBacan
 
-VitaSpotify is a Spotify Connect client for the PlayStation Vita. It lets a
+A fork of [lolhop/vitaspotify](https://github.com/lolhop/vitaspotify).
+
+SpotiBacan is a Spotify Connect client for the PlayStation Vita. It lets a
 jailbroken Vita show up as a Spotify device, play music, browse playlists and
 search results, and save tracks for offline playback.
 
@@ -19,8 +21,10 @@ This is unofficial homebrew and requires Spotify Premium. It is built on
 
 1. Install a current TLS setup on the Vita, such as
    [iTLS-Enso](https://github.com/CelesteBlue-dev/ITLS-Enso).
-2. Install `vitaspotify.vpk` with VitaShell.
-3. Launch VitaSpotify and choose `Sign in with Spotify`. It shows a short code.
+2. Download `SpotiBacan.vpk` from the
+   [releases](https://github.com/ohquebacan/vitaspotify/releases) and install it
+   with VitaShell.
+3. Launch SpotiBacan and choose `Sign in with Spotify`. It shows a short code.
 4. On a phone or a computer, open <https://spotify.com/pair> and enter the code.
 
 That is the whole sign-in. No helper to run on a computer, no file to copy, and
@@ -70,7 +74,7 @@ sudo apt install build-essential cmake wget protobuf-compiler python3-protobuf
 Then build:
 
 ```bash
-git clone https://github.com/lolhop/vitaspotify.git
+git clone https://github.com/ohquebacan/vitaspotify.git
 cd vitaspotify
 export VITASDK="$HOME/vitasdk"
 export PATH="$VITASDK/bin:$PATH"
@@ -119,7 +123,7 @@ tools/protoc/            Windows protoc binary and protobuf include files
 
 ## Troubleshooting
 
-If the LiveArea bubble will not delete after a crash, close VitaSpotify from the
+If the LiveArea bubble will not delete after a crash, close SpotiBacan from the
 PS button menu or reboot the Vita, then delete `ux0:app/VSPOT0001` with
 VitaShell. Saved login and log data lives in `ux0:data/vitaspotify/`.
 
@@ -138,10 +142,10 @@ VPNs or firewall rules that block local device discovery.
 No real Spotify credentials are checked into this repo. `auth.json` and
 `dev_login.txt` are ignored on purpose.
 
-The app code in this repository is MIT licensed. VitaSpotify also vendors cspot,
+The app code in this repository is MIT licensed. SpotiBacan also vendors cspot,
 which is GPLv3. If you distribute builds that include cspot, make sure you follow
 the GPLv3 requirements for that combined binary.
 
-VitaSpotify is not affiliated with Spotify.
+SpotiBacan is not affiliated with Spotify.
 
 AI tools were used while writing and debugging the code. No generative AI was used for assets.
